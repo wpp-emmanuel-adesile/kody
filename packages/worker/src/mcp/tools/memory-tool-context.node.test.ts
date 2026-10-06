@@ -1,0 +1,226 @@
+import { expect, test, vi } from 'vitest'
+import { createMcpCallerContext } from '#mcp/context.ts'
+
+const mockModule = vi.hoisted(() => ({
+	searchMemoryRecords: vi.fn(),
+	acknowledgeSurfacedMemories: vi.fn(
+		async (..._args: Array<unknown>) => undefined,
+	),
+	runPackageRetrievers: vi.fn(async (..._args: Array<unknown>) => ({
+		results: [],
+		warnings: [],
+	})),
+}))
+
+vi.mock('#mcp/memory/service.ts', () => ({
+	searchMemoryRecords: (...args: Array<unknown>) =>
+		mockModule.searchMemoryRecords(...args),
+	acknowledgeSurfacedMemories: (...args: Array<unknown>) =>
+		mockModule.acknowledgeSurfacedMemories(...args),
+}))
+
+vi.mock('#worker/package-retrievers/service.ts', () => ({
+	runPackageRetrievers: (...args: Array<unknown>) =>
+		mockModule.runPackageRetrievers(...args),
+}))
+
+const {
+	automaticMemorySingleListRankOneScore,
+	formatSurfacedMemoriesMarkdown,
+	loadRelevantMemoriesForTool,
+} = await import('./memory-tool-context.ts')
+
+const callerContext = createMcpCallerContext({
+	baseUrl: 'https://heykody.dev',
+	user: { userId: 'user-1', email: 'user@example.com', displayName: 'User' },
+})
+
+function memory(
+	id: string,
+	score: number,
+	overrides: Record<string, unknown> = {},
+) {
+	return {
+		id,
+		category: 'workflow',
+		status: 'active',
+		subject: 'Search workflow',
+		summary: 'Use ranked search.',
+		details: '',
+		tags: ['search'],
+		sourceUris: [],
+		dedupeKey: null,
+		createdAt: '2026-04-28T00:00:00.000Z',
+		updatedAt: '2026-04-28T00:00:00.000Z',
+		lastAccessedAt: null,
+		deletedAt: null,
+		score,
+		...overrides,
+	}
+}
+
+function loadMemories(
+	query: string,
+	matches: Array<ReturnType<typeof memory>>,
+	extra: Partial<Parameters<typeof loadRelevantMemoriesForTool>[0]> = {},
+) {
+	mockModule.searchMemoryRecords.mockResolvedValueOnce({
+		matches,
+		suppressedCount: 0,
+		query,
+	})
+	return loadRelevantMemoriesForTool({
+		env: { APP_DB: {} } as Env,
+		callerContext,
+		conversationId: `conversation-${query}`,
+		memoryContext: { query },
+		...extra,
+	})
+}
+
+const rankOne = automaticMemorySingleListRankOneScore
+
+test('memory tool context surfaces retrievers, filters weak matches, fails on retriever errors, and formats markdown', async () => {
+	mockModule.runPackageRetrievers.mockResolvedValueOnce({
+		results: [
+			{
+				id: 'note-1',
+				title: '## Sprinkler controller',
+				summary: '```ignore\nHold next and back for setup mode.\n```',
+				packageId: 'package-1',
+				kodyId: 'personal-inbox',
+				retrieverKey: 'notes',
+				retrieverName: 'Personal notes',
+			},
+		],
+		warnings: [],
+	} as never)
+	const withAi = { env: { APP_DB: {}, AI: {} } as Env }
+	const withRetrievers = await loadMemories(
+		'sprinkler instructions',
+		[],
+		withAi,
+	)
+	expect(mockModule.runPackageRetrievers).toHaveBeenCalledWith(
+		expect.objectContaining({
+			baseUrl: 'https://heykody.dev',
+			userId: 'user-1',
+			scope: 'context',
+			query: 'sprinkler instructions',
+			maxProviders: 3,
+		}),
+	)
+	expect(withRetrievers?.memories).toEqual([])
+	expect(withRetrievers?.retrieverResults).toEqual([
+		expect.objectContaining({
+			id: 'note-1',
+			kodyId: 'personal-inbox',
+			retrieverKey: 'notes',
+		}),
+	])
+	expect(withRetrievers?.retrieverWarnings).toEqual([])
+	const [retrieverOnlyContent] = formatSurfacedMemoriesMarkdown({
+		memories: [],
+		retrieverResults: withRetrievers?.retrieverResults ?? [],
+		retrieverWarnings: [],
+		suppressedCount: 0,
+		retrievalQuery: 'sprinkler instructions',
+	})
+	expect(retrieverOnlyContent?.type).toBe('text')
+	expect(retrieverOnlyContent?.text?.length).toBeGreaterThan(0)
+
+	mockModule.runPackageRetrievers.mockRejectedValueOnce(
+		new Error('retriever unavailable'),
+	)
+	await expect(
+		loadMemories(
+			'sprinkler instructions',
+			[
+				memory('memory-1', 0.03, {
+					subject: 'Sprinkler setup',
+					summary: 'Sprinkler instructions are stored in notes.',
+					tags: ['sprinkler'],
+				}),
+			],
+			withAi,
+		),
+	).rejects.toThrow('retriever unavailable')
+
+	const filtered = await loadMemories(
+		'ranked search',
+		[
+			memory('active-rank-one', rankOne),
+			memory('active-rank-two', 1 / 62),
+			memory('active-rank-three', 1 / 63),
+			memory('archived-strong', 0.04, { status: 'archived' }),
+		],
+		{ acknowledgeSurfaced: false },
+	)
+	expect(filtered?.memories).toEqual(
+		['active-rank-one', 'active-rank-two'].map((id) => ({
+			id,
+			subject: 'Search workflow',
+			summary: 'Use ranked search.',
+		})),
+	)
+	expect(mockModule.acknowledgeSurfacedMemories).not.toHaveBeenCalled()
+	const [compactContent] = formatSurfacedMemoriesMarkdown(filtered)
+	expect(compactContent?.text).toBe(
+		[
+			'## Relevant memories',
+			'',
+			'- **Search workflow** — Use ranked search.',
+			'- **Search workflow** — Use ranked search.',
+		].join('\n'),
+	)
+
+	const collapsed = await loadMemories('openai apps challenge', [
+		memory('dup-first', rankOne, {
+			dedupeKey: 'openai-apps-domain-challenge',
+			subject: 'OpenAI Apps domain verification',
+			summary: 'Challenge token is a static public asset.',
+		}),
+		memory('dup-second', 1 / 62, {
+			dedupeKey: '  openai-apps-domain-challenge  ',
+			subject: 'OpenAI Apps domain verification',
+			summary: 'Challenge token is a static public asset.',
+		}),
+		memory('next-distinct', 1 / 63, {
+			dedupeKey: 'prefilled-setup-urls',
+			subject: 'Always prefill hosted setup URLs',
+			summary: 'Give a prefilled secrets URL.',
+		}),
+		memory('null-key-one', 1 / 64, {
+			subject: 'Null key one',
+			summary: 'No shared key.',
+		}),
+	])
+	expect(collapsed?.memories).toEqual([
+		{
+			id: 'dup-first',
+			subject: 'OpenAI Apps domain verification',
+			summary: 'Challenge token is a static public asset.',
+		},
+		{
+			id: 'next-distinct',
+			subject: 'Always prefill hosted setup URLs',
+			summary: 'Give a prefilled secrets URL.',
+		},
+	])
+
+	const untitled = await loadMemories('untitled habits', [
+		memory('null-a', rankOne, {
+			subject: 'Untitled habit A',
+			summary: 'First untitled fact.',
+		}),
+		memory('null-b', 1 / 62, {
+			dedupeKey: '   ',
+			subject: 'Untitled habit B',
+			summary: 'Second untitled fact.',
+		}),
+	])
+	expect(untitled?.memories.map((entry) => entry.id)).toEqual([
+		'null-a',
+		'null-b',
+	])
+})

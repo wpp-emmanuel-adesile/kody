@@ -1,0 +1,10 @@
+{
+	"version": 1,
+	"skills": {
+		"ship-pr": {
+			"source": "./.agents/skills/ship-pr",
+			"sourceType": "local",
+			"computedHash": "3ec42e5a7604b9aeb06d6c8ef4ca7456acf1f4e03d9d2d7bdd26a3e1cdd032b8"
+		}
+	}
+}

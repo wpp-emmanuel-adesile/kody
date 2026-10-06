@@ -1,0 +1,296 @@
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
+import { expect, test } from 'vitest'
+import { consoleError } from '#worker/test-support/console-spies.ts'
+
+import { generate } from './runtime-worker-config.ts'
+import { parseJsonc } from './resource-utils.ts'
+
+const runtimeBaseConfigPath = 'packages/runtime-worker/wrangler.jsonc'
+
+type Entry = Record<string, unknown>
+type EnvConfig = {
+	name?: string
+	durable_objects?: { bindings?: Array<Entry> }
+	d1_databases?: Array<Entry>
+	analytics_engine_datasets?: Array<Entry>
+	queues?: { producers?: Array<Entry> }
+	services?: Array<Entry>
+	workflows?: Array<Entry>
+	routes?: unknown
+	workers_dev?: boolean
+	vars?: Record<string, unknown>
+}
+type WorkerConfig = {
+	name?: string
+	env?: Record<string, EnvConfig>
+	migrations?: Array<{ tag?: string; transferred_classes?: unknown }>
+}
+
+function byName(env: EnvConfig | undefined, name: string) {
+	return env?.durable_objects?.bindings?.find(
+		(binding) => binding.name === name,
+	)
+}
+
+test('runtime worker binds RepoSessionIndex cross-script next to RepoSession', async () => {
+	const config = parseJsonc<WorkerConfig>(
+		await readFile(runtimeBaseConfigPath, 'utf8'),
+	)
+	for (const envName of ['production', 'preview']) {
+		const env = config.env?.[envName]
+		expect(byName(env, 'REPO_SESSION')).toMatchObject({
+			class_name: 'RepoSession',
+			script_name: 'kody-platform',
+		})
+		expect(byName(env, 'REPO_SESSION_INDEX')).toMatchObject({
+			class_name: 'RepoSessionIndex',
+			script_name: 'kody-platform',
+		})
+	}
+})
+
+/** `FOO_BAR_QUEUE` produces into `<prefix>-foo-bar`. */
+function producers(prefix: string, ...bindings: Array<string>) {
+	return bindings.map((binding) => ({
+		binding,
+		queue: `${prefix}-${binding
+			.replace(/_QUEUE$/, '')
+			.toLowerCase()
+			.replaceAll('_', '-')}`,
+	}))
+}
+
+function buildMainGeneratedConfig(envName: string) {
+	const doBinding = (
+		name: string,
+		class_name: string,
+		script_name: string,
+	) => ({
+		name,
+		class_name,
+		script_name,
+	})
+	const env = {
+		durable_objects: {
+			bindings: [
+				doBinding('USER_METER', 'UserMeter', 'kody-platform'),
+				doBinding('MCP_OBJECT', 'MCP', 'kody-platform'),
+				doBinding('STORAGE_RUNNER', 'StorageRunner', 'kody-runtime'),
+				doBinding('RUN_LOG', 'RunLog', 'kody-runtime'),
+			],
+		},
+		services: [
+			{
+				binding: 'RUNTIME_WORKER',
+				service: 'kody-runtime',
+				entrypoint: 'RuntimeWorkerService',
+			},
+			{ binding: 'JOBS', service: 'kody-pr-7-jobs', entrypoint: 'JobsService' },
+		],
+		workflows: [
+			{
+				binding: 'DYNAMIC_CALLABLE_WORKFLOWS',
+				name: 'kody-runtime-dynamic-callable-workflows',
+				class_name: 'DynamicCallableWorkflow',
+				script_name: 'kody-runtime',
+			},
+		],
+		d1_databases: [
+			{
+				binding: 'APP_DB',
+				database_name: 'kody-pr-7-db',
+				database_id: 'd1-app-id',
+				migrations_dir: './migrations',
+			},
+			{
+				binding: 'AUDIT_DB',
+				database_name: 'kody-pr-7-audit-db',
+				database_id: 'd1-audit-id',
+				migrations_dir: './audit-migrations',
+			},
+		],
+		kv_namespaces: [
+			{ binding: 'OAUTH_KV', id: 'kv-oauth-id' },
+			{ binding: 'BUNDLE_ARTIFACTS_KV', id: 'kv-bundle-id' },
+		],
+		r2_buckets: ['COMMUNITY_ASSETS', 'EMAIL_BLOBS', 'REPO_SESSION_BLOBS'].map(
+			(binding) => ({
+				binding,
+				bucket_name: `kody-pr-7-${binding.toLowerCase().replaceAll('_', '-')}`,
+			}),
+		),
+		queues: {
+			producers: [
+				...producers('kody-pr-7', 'WEBHOOK_DISPATCH_QUEUE'),
+				...(envName === 'production'
+					? producers(
+							'kody',
+							'PLATFORM_FEEDBACK_DISPATCH_QUEUE',
+							'COMMUNITY_ACTIVITY_DISPATCH_QUEUE',
+							'COMMUNITY_LISTING_PUBLISHED_DISPATCH_QUEUE',
+							'SCHEDULED_DISPATCH_QUEUE',
+							'PACKAGE_EVENTS_DISPATCH_QUEUE',
+						)
+					: []),
+			],
+		},
+		vectorize: [
+			{
+				binding: 'CAPABILITY_VECTOR_INDEX',
+				index_name: 'kody-capabilities-pr-7',
+			},
+		],
+		analytics_engine_datasets: [
+			'USAGE_EVENTS',
+			'FLAG_EXPOSURES',
+			'MCP_PROTOCOL_EVENTS',
+			'ONBOARDING_FUNNEL_EVENTS',
+		].map((binding) => ({
+			binding,
+			dataset: `kody_${binding.toLowerCase()}_pr`,
+		})),
+		vars: {
+			APP_BASE_URL: 'https://kody-pr-7.example.workers.dev',
+			PACKAGE_APP_BASE_URL: envName === 'production' ? 'https://kody.run' : '',
+			...(envName === 'preview'
+				? { ARTIFACTS_NAMESPACE: 'kody-pr-7' }
+				: { ARTIFACTS_NAMESPACE: 'production' }),
+		} as Record<string, unknown>,
+	}
+	return { name: 'kody', env: { [envName]: env } }
+}
+
+async function generateRuntime(input: {
+	envName: 'preview' | 'production'
+	workerPrefix: string
+	mainWorkerName: string
+	mainVars?: Record<string, unknown>
+}) {
+	consoleError.mockImplementation(() => {})
+	const tempDir = await mkdtemp(path.join(os.tmpdir(), 'kody-runtime-config-'))
+	try {
+		const mainConfig = buildMainGeneratedConfig(input.envName)
+		Object.assign(mainConfig.env[input.envName]?.vars ?? {}, input.mainVars)
+		const mainConfigPath = path.join(tempDir, 'main.generated.json')
+		await writeFile(mainConfigPath, JSON.stringify(mainConfig))
+		const outConfigPath = path.join(tempDir, 'runtime.generated.json')
+		await generate({
+			envName: input.envName,
+			mainConfigPath,
+			runtimeWorkerName: `${input.workerPrefix}-runtime`,
+			platformWorkerName: `${input.workerPrefix}-platform`,
+			mainWorkerName: input.mainWorkerName,
+			baseConfigPath: runtimeBaseConfigPath,
+			outConfigPath,
+		})
+		const read = async (filePath: string) =>
+			parseJsonc<WorkerConfig>(await readFile(filePath, 'utf8'))
+		return {
+			runtime: await read(outConfigPath),
+			patchedMain: await read(mainConfigPath),
+		}
+	} finally {
+		await rm(tempDir, { force: true, recursive: true })
+	}
+}
+
+test('generate rewrites worker names, copies resource ids, and patches the main config', async () => {
+	const { runtime, patchedMain } = await generateRuntime({
+		envName: 'preview',
+		workerPrefix: 'kody-pr-7',
+		mainWorkerName: 'kody-pr-7',
+	})
+	const previewEnv = runtime.env?.preview
+	expect(runtime.name).toBe('kody-pr-7-runtime')
+	expect(previewEnv?.name).toBe('kody-pr-7-runtime')
+	// Cross-script references point at the resolved platform worker name.
+	expect(byName(previewEnv, 'USER_METER')?.script_name).toBe(
+		'kody-pr-7-platform',
+	)
+	expect(byName(previewEnv, 'REPO_SESSION_INDEX')).toMatchObject({
+		class_name: 'RepoSessionIndex',
+		script_name: 'kody-pr-7-platform',
+	})
+	// Resource identifiers are copied from the provisioned main config.
+	expect(previewEnv?.d1_databases?.[0]).toMatchObject({
+		binding: 'APP_DB',
+		database_name: 'kody-pr-7-db',
+		database_id: 'd1-app-id',
+	})
+	expect(previewEnv?.queues?.producers?.[0]).toMatchObject({
+		binding: 'WEBHOOK_DISPATCH_QUEUE',
+		queue: 'kody-pr-7-webhook-dispatch',
+	})
+	expect(previewEnv?.vars?.ARTIFACTS_NAMESPACE).toBe('kody-pr-7')
+	// The workflow gets a per-worker name.
+	expect(previewEnv?.workflows?.[0]?.name).toBe(
+		'kody-pr-7-runtime-dynamic-callable-workflows',
+	)
+	// Preview has no package-app domain, so no routes are published.
+	expect(previewEnv?.routes).toBeUndefined()
+	// The main worker's resolved vars are merged in.
+	expect(previewEnv?.vars?.APP_BASE_URL).toBe(
+		'https://kody-pr-7.example.workers.dev',
+	)
+
+	// The main config was patched in place to reference the resolved
+	// runtime worker name.
+	const mainEnv = patchedMain.env?.preview
+	expect(mainEnv?.services?.[0]?.service).toBe('kody-pr-7-runtime')
+	// The main config keeps every cross-script reference: the origin never
+	// owns these classes in preview, so there is no bootstrap variant.
+	expect(byName(mainEnv, 'STORAGE_RUNNER')?.script_name).toBe(
+		'kody-pr-7-runtime',
+	)
+	expect(mainEnv?.workflows?.[0]).toMatchObject({
+		name: 'kody-pr-7-runtime-dynamic-callable-workflows',
+		script_name: 'kody-pr-7-runtime',
+	})
+})
+
+const packageAppRoutes = [
+	{ pattern: 'kody.run/*', zone_name: 'kody.run' },
+	{ pattern: '*.kody.run/*', zone_name: 'kody.run' },
+]
+
+test('generate publishes the package-app custom domain for production', async () => {
+	const { runtime } = await generateRuntime({
+		envName: 'production',
+		workerPrefix: 'kody',
+		mainWorkerName: 'kody',
+	})
+	// Package-app hosts are zone routes, never custom domains: a custom
+	// domain in a zone whose route table the deploy also publishes gets
+	// detached (deleting its DNS record) when the routes are replaced.
+	expect(runtime.env?.production?.routes).toEqual(packageAppRoutes)
+	expect(runtime.env?.production?.name).toBe('kody-runtime')
+	expect(runtime.env?.production?.workers_dev).toBe(true)
+	// The storage transfer migration survives generation untouched.
+	expect(runtime.migrations?.[0]?.tag).toBe('v1')
+	expect(Array.isArray(runtime.migrations?.[0]?.transferred_classes)).toBe(true)
+})
+
+test('generate keeps a GitHub PACKAGE_APP_LEGACY_HOSTS overlay on runtime zone routes', async () => {
+	// Overlay already applied to the main generated config, the way
+	// `writeGeneratedWranglerConfig` does for a non-empty GitHub var.
+	const { runtime } = await generateRuntime({
+		envName: 'production',
+		workerPrefix: 'kody',
+		mainWorkerName: 'kody',
+		mainVars: {
+			PACKAGE_APP_LEGACY_HOSTS: 'legacy-apps.example.org',
+			PACKAGE_APP_LEGACY_REDIRECT: 'true',
+		},
+	})
+	expect(runtime.env?.production?.vars).toMatchObject({
+		PACKAGE_APP_LEGACY_HOSTS: 'legacy-apps.example.org',
+		PACKAGE_APP_LEGACY_REDIRECT: 'true',
+	})
+	expect(runtime.env?.production?.routes).toEqual([
+		...packageAppRoutes,
+		{ pattern: 'legacy-apps.example.org/*', zone_name: 'example.org' },
+		{ pattern: '*.legacy-apps.example.org/*', zone_name: 'example.org' },
+	])
+})

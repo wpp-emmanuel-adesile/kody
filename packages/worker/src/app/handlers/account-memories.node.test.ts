@@ -1,0 +1,339 @@
+import { expect, test, vi } from 'vitest'
+import type * as authenticatedUserModule from '#app/authenticated-user.ts'
+import type * as memoryRepo from '#mcp/memory/repo.ts'
+import type * as memoryService from '#mcp/memory/service.ts'
+import { buildMemoriesExportFilename } from '#universal/memory-export.ts'
+
+const mockModule = vi.hoisted(() => {
+	const memoryRow = {
+		id: '11111111-1111-4111-8111-111111111111',
+		category: 'preferences',
+		status: 'active' as const,
+		subject: 'Favorite editor',
+		summary: 'Prefers VS Code for TypeScript work.',
+		details: 'Uses the Remix extension and oxlint.',
+		tags: ['editor', 'typescript'],
+		sourceUris: ['https://example.com/notes/editor'],
+		dedupeKey: 'prefs:editor',
+		createdAt: new Date(0).toISOString(),
+		updatedAt: new Date(0).toISOString(),
+		lastAccessedAt: null as string | null,
+		deletedAt: null as string | null,
+	}
+	const memoryDbRow = {
+		id: memoryRow.id,
+		user_id: 'stable-user-1',
+		category: memoryRow.category,
+		status: memoryRow.status,
+		subject: memoryRow.subject,
+		summary: memoryRow.summary,
+		details: memoryRow.details,
+		tags_json: JSON.stringify(memoryRow.tags),
+		source_uris_json: JSON.stringify(memoryRow.sourceUris),
+		dedupe_key: memoryRow.dedupeKey,
+		created_at: memoryRow.createdAt,
+		updated_at: memoryRow.updatedAt,
+		last_accessed_at: memoryRow.lastAccessedAt,
+		deleted_at: memoryRow.deletedAt,
+	}
+	return {
+		memoryRow,
+		memoryDbRow,
+		readAuthenticatedAppUser: vi.fn<
+			typeof authenticatedUserModule.readAuthenticatedAppUser
+		>(async () => ({
+			sessionUserId: '42',
+			userId: 42,
+			username: 'test-user',
+			email: 'user@example.com',
+			emailVerified: true,
+			emailVerificationDelivery: null,
+			displayName: 'user',
+			roles: ['user'],
+			permissions: [],
+			artifactOwnerIds: [],
+			mcpUser: {
+				userId: 'stable-user-1',
+				email: 'user@example.com',
+				username: 'test-user',
+				displayName: 'user',
+			},
+		})),
+		readAuthSessionResult: async () => ({ session: null, setCookie: null }),
+		listMemoriesByUserId: vi.fn<typeof memoryRepo.listMemoriesByUserId>(
+			async () => [memoryDbRow],
+		),
+		listMemoriesByUserIdPage: vi.fn<typeof memoryRepo.listMemoriesByUserIdPage>(
+			async () => [memoryDbRow],
+		),
+		getMemory: vi.fn<typeof memoryService.getMemory>(async () => memoryRow),
+		deleteMemory: vi.fn<typeof memoryService.deleteMemory>(async () => ({
+			...memoryRow,
+			status: 'deleted' as const,
+		})),
+	}
+})
+
+const { memoryRow } = mockModule
+
+vi.mock('#app/authenticated-user.ts', () => ({
+	readAuthenticatedAppUser: (
+		...args: Parameters<typeof authenticatedUserModule.readAuthenticatedAppUser>
+	) => mockModule.readAuthenticatedAppUser(...args),
+}))
+
+vi.mock('#app/auth-session.ts', () => ({
+	readAuthSessionResult: () => mockModule.readAuthSessionResult(),
+}))
+
+vi.mock('#app/auth-redirect.ts', () => ({
+	redirectToLogin: () => new Response(null, { status: 302 }),
+	redirectToLoginWhenUnauthenticated: () => new Response(null, { status: 302 }),
+}))
+
+vi.mock('#app/ssr-render.tsx', () => ({
+	renderAppPage: async () => new Response('ok'),
+}))
+
+vi.mock('#mcp/memory/repo.ts', () => ({
+	listMemoriesByUserId: (
+		...args: Parameters<typeof memoryRepo.listMemoriesByUserId>
+	) => mockModule.listMemoriesByUserId(...args),
+	listMemoriesByUserIdPage: (
+		...args: Parameters<typeof memoryRepo.listMemoriesByUserIdPage>
+	) => mockModule.listMemoriesByUserIdPage(...args),
+}))
+
+vi.mock('#mcp/memory/service.ts', () => ({
+	getMemory: (...args: Parameters<typeof memoryService.getMemory>) =>
+		mockModule.getMemory(...args),
+	deleteMemory: (...args: Parameters<typeof memoryService.deleteMemory>) =>
+		mockModule.deleteMemory(...args),
+}))
+
+const { createAccountMemoriesApiHandler, createAccountMemoriesExportHandler } =
+	await import('./account-memories.ts')
+
+const env = { APP_DB: {} as D1Database } as Env
+
+function createClient(
+	createHandler: (env: Env) => { handler: (input: never) => Promise<Response> },
+	path: string,
+) {
+	const { handler } = createHandler(env)
+	return (search = '', init?: RequestInit) =>
+		handler({
+			request: new Request(`https://example.com${path}${search}`, init),
+			params: {},
+		} as never)
+}
+
+const postJson = (body: Record<string, unknown>): RequestInit => ({
+	method: 'POST',
+	headers: { 'Content-Type': 'application/json' },
+	body: JSON.stringify(body),
+})
+
+test('memories API lists, filters, and selects user-scoped memories', async () => {
+	const request = createClient(
+		createAccountMemoriesApiHandler,
+		'/account/memories.json',
+	)
+
+	const listResponse = await request()
+	expect(listResponse.status).toBe(200)
+	expect(listResponse.headers.get('Cache-Control')).toBe('no-store')
+	expect(mockModule.listMemoriesByUserId).toHaveBeenCalledWith(
+		expect.anything(),
+		'stable-user-1',
+		expect.objectContaining({
+			statuses: ['active', 'archived'],
+			limit: 100,
+		}),
+	)
+	await expect(listResponse.json()).resolves.toEqual({
+		ok: true,
+		email: 'user@example.com',
+		username: 'test-user',
+		memories: [
+			{
+				id: memoryRow.id,
+				subject: memoryRow.subject,
+				category: memoryRow.category,
+				status: memoryRow.status,
+				tags: memoryRow.tags,
+				summary: memoryRow.summary,
+				updatedAt: memoryRow.updatedAt,
+			},
+		],
+		selectedMemory: null,
+		query: '',
+		includeDeleted: false,
+	})
+
+	const filtered = await request(
+		`?q=editor&includeDeleted=true&selected=${memoryRow.id}`,
+	)
+	expect(filtered.status).toBe(200)
+	expect(mockModule.listMemoriesByUserId).toHaveBeenCalledWith(
+		expect.anything(),
+		'stable-user-1',
+		expect.objectContaining({
+			statuses: ['active', 'archived', 'deleted'],
+		}),
+	)
+	expect(mockModule.getMemory).toHaveBeenCalledWith(
+		expect.objectContaining({
+			userId: 'stable-user-1',
+			memoryId: memoryRow.id,
+		}),
+	)
+	await expect(filtered.json()).resolves.toMatchObject({
+		ok: true,
+		query: 'editor',
+		includeDeleted: true,
+		selectedMemory: expect.objectContaining({
+			id: memoryRow.id,
+			details: memoryRow.details,
+			sourceUris: memoryRow.sourceUris,
+			dedupeKey: memoryRow.dedupeKey,
+		}),
+	})
+})
+
+test('memories API soft/force deletes and rejects invalid delete requests', async () => {
+	const request = createClient(
+		createAccountMemoriesApiHandler,
+		'/account/memories.json',
+	)
+
+	for (const force of [false, true]) {
+		const response = await request(
+			'',
+			postJson({
+				action: 'delete',
+				memoryId: memoryRow.id,
+				...(force ? { force } : {}),
+			}),
+		)
+		expect([force, response.status]).toEqual([force, 200])
+		expect(mockModule.deleteMemory).toHaveBeenLastCalledWith(
+			expect.objectContaining({
+				userId: 'stable-user-1',
+				memoryId: memoryRow.id,
+				force,
+			}),
+		)
+	}
+
+	const rejections = [
+		[{ action: 'delete' }, 400],
+		[{ action: 'upsert' }, 400],
+		[{ action: 'delete', memoryId: 'missing' }, 404],
+	] as const
+	for (const [body, status] of rejections) {
+		if (status === 404)
+			mockModule.deleteMemory.mockResolvedValueOnce(null as never)
+		const response = await request('', postJson(body))
+		expect([body, response.status]).toEqual([body, status])
+	}
+})
+
+test('memories export filename uses the UTC calendar date', () => {
+	expect(
+		buildMemoriesExportFilename(new Date('2026-08-31T23:30:00.000Z')),
+	).toBe('kody-memories-2026-08-31.json')
+})
+
+test('memories export downloads the signed-in user memories as JSON', async () => {
+	const request = createClient(
+		createAccountMemoriesExportHandler,
+		'/account/memories-export.json',
+	)
+
+	mockModule.readAuthenticatedAppUser.mockResolvedValueOnce(null as never)
+	expect((await request()).status).toBe(401)
+
+	const defaultExport = await request()
+	expect(defaultExport.status).toBe(200)
+	expect(defaultExport.headers.get('Cache-Control')).toBe('no-store')
+	expect(defaultExport.headers.get('Content-Type')).toBe(
+		'application/json; charset=utf-8',
+	)
+	expect(defaultExport.headers.get('Content-Disposition')).toMatch(
+		/^attachment; filename="kody-memories-\d{4}-\d{2}-\d{2}\.json"$/,
+	)
+	expect(mockModule.listMemoriesByUserIdPage).toHaveBeenCalledWith(
+		expect.objectContaining({
+			userId: 'stable-user-1',
+			afterId: null,
+			statuses: ['active', 'archived'],
+			limit: 200,
+		}),
+	)
+	const payload = (await defaultExport.json()) as {
+		kind: string
+		version: number
+		exportedAt: string
+		includeDeleted: boolean
+		memories: Array<Record<string, unknown>>
+	}
+	expect(payload.kind).toBe('kody-memories')
+	expect(payload.version).toBe(1)
+	expect(payload.exportedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/)
+	expect(payload.includeDeleted).toBe(false)
+	expect(payload.memories).toEqual([
+		{
+			id: memoryRow.id,
+			subject: memoryRow.subject,
+			category: memoryRow.category,
+			status: memoryRow.status,
+			tags: memoryRow.tags,
+			summary: memoryRow.summary,
+			details: memoryRow.details,
+			sourceUris: memoryRow.sourceUris,
+			dedupeKey: memoryRow.dedupeKey,
+			createdAt: memoryRow.createdAt,
+			updatedAt: memoryRow.updatedAt,
+			lastAccessedAt: memoryRow.lastAccessedAt,
+			deletedAt: memoryRow.deletedAt,
+		},
+	])
+	expect(JSON.stringify(payload)).not.toContain('user@example.com')
+	expect(JSON.stringify(payload)).not.toContain('stable-user-1')
+	expect(payload.memories[0]).not.toHaveProperty('user_id')
+	expect(payload.memories[0]).not.toHaveProperty('userId')
+
+	const withDeleted = await request('?includeDeleted=true')
+	expect(withDeleted.status).toBe(200)
+	expect(mockModule.listMemoriesByUserIdPage).toHaveBeenLastCalledWith(
+		expect.objectContaining({
+			statuses: ['active', 'archived', 'deleted'],
+		}),
+	)
+	await expect(withDeleted.json()).resolves.toMatchObject({
+		includeDeleted: true,
+	})
+
+	mockModule.listMemoriesByUserIdPage.mockClear()
+	const firstPage = Array.from({ length: 200 }, (_, index) => ({
+		...mockModule.memoryDbRow,
+		id: `page-1-${String(index).padStart(3, '0')}`,
+	}))
+	mockModule.listMemoriesByUserIdPage
+		.mockResolvedValueOnce(firstPage)
+		.mockResolvedValueOnce([{ ...mockModule.memoryDbRow, id: 'page-2-000' }])
+	const pagedPayload = (await (await request()).json()) as {
+		memories: Array<{ id: string }>
+	}
+	expect(pagedPayload.memories).toHaveLength(201)
+	expect(pagedPayload.memories.at(-1)?.id).toBe('page-2-000')
+	expect(mockModule.listMemoriesByUserIdPage).toHaveBeenNthCalledWith(
+		2,
+		expect.objectContaining({
+			afterId: 'page-1-199',
+		}),
+	)
+
+	expect((await request('', { method: 'POST' })).status).toBe(405)
+})

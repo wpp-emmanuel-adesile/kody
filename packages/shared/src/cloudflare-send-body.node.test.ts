@@ -1,0 +1,73 @@
+import { expect, test } from 'vitest'
+import { toCloudflareSendBody } from './cloudflare-send-body.ts'
+
+type OutboundMessage = {
+	from: string
+	to: string
+	subject: string
+	html: string
+	text?: string
+	replyTo?: string | null
+}
+
+test('toCloudflareSendBody maps replyTo to reply_to and omits camelCase', () => {
+	expect(
+		toCloudflareSendBody({
+			from: 'kody@kody.codes',
+			to: 'user@example.com',
+			subject: 'Verify',
+			html: '<p>Verify</p>',
+			text: 'Verify',
+			replyTo: 'support@kody.codes',
+		}),
+	).toEqual({
+		from: 'kody@kody.codes',
+		to: 'user@example.com',
+		subject: 'Verify',
+		html: '<p>Verify</p>',
+		text: 'Verify',
+		reply_to: 'support@kody.codes',
+	})
+	expect(
+		toCloudflareSendBody({
+			from: 'kody@kody.codes',
+			to: 'user@example.com',
+			subject: 'Override',
+			html: '<p>Override</p>',
+			replyTo: '  abuse@kody.codes  ',
+		}),
+	).toEqual({
+		from: 'kody@kody.codes',
+		to: 'user@example.com',
+		subject: 'Override',
+		html: '<p>Override</p>',
+		reply_to: 'abuse@kody.codes',
+	})
+	expect(
+		toCloudflareSendBody<OutboundMessage>({
+			from: 'support@kody.codes',
+			to: 'user@example.com',
+			subject: 'Support',
+			html: '<p>Support</p>',
+		}),
+	).toEqual({
+		from: 'support@kody.codes',
+		to: 'user@example.com',
+		subject: 'Support',
+		html: '<p>Support</p>',
+	})
+	expect(
+		toCloudflareSendBody({
+			from: 'support@kody.codes',
+			to: 'user@example.com',
+			subject: 'Blank',
+			html: '<p>Blank</p>',
+			replyTo: '   ',
+		}),
+	).toEqual({
+		from: 'support@kody.codes',
+		to: 'user@example.com',
+		subject: 'Blank',
+		html: '<p>Blank</p>',
+	})
+})
